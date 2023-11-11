@@ -1131,6 +1131,8 @@ static int mov_read_ftyp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     int ret = ffio_read_size(pb, type, 4);
     if (ret < 0)
         return ret;
+    if (c->fc->nb_streams)
+        return AVERROR_INVALIDDATA;
 
     if (strcmp(type, "qt  "))
         c->isom = 1;
@@ -4469,6 +4471,10 @@ static int mov_read_trak(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     AVStream *st;
     MOVStreamContext *sc;
     int ret;
+
+    if (c->is_still_picture_avif) {
+        return AVERROR_INVALIDDATA;
+    }
 
     st = avformat_new_stream(c->fc, NULL);
     if (!st) return AVERROR(ENOMEM);
