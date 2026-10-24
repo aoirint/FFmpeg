@@ -29,6 +29,7 @@
 #include "libavcodec/bytestream.h"
 #include "libavutil/avstring.h"
 #include "libavutil/base64.h"
+#include "libavutil/file.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/lfg.h"
 #include "libavutil/md5.h"
@@ -134,6 +135,8 @@ typedef struct RTMPContext {
     char          auth_params[500];
     int           do_reconnect;
     int           auth_tried;
+    int           strict_paths;               ///< If true, enforce strict string matching on rtmp stream and application
+    char          *strict_stream_file;        ///< File containing the expected stream name in listen mode
 } RTMPContext;
 
 #define PLAYER_KEY_OPEN_PART_LEN 30   ///< length of partial key used for first client digest signing
@@ -540,9 +543,16 @@ static int read_connect(URLContext *s, RTMPContext *rt)
                                  "app", tmpstr, sizeof(tmpstr));
     if (ret)
         av_log(s, AV_LOG_WARNING, "App field not found in connect\n");
-    if (!ret && strcmp(tmpstr, rt->app))
-        av_log(s, AV_LOG_WARNING, "App field don't match up: %s <-> %s\n",
+    if (!ret && strcmp(tmpstr, rt->app)) {
+        if (rt->strict_paths) {
+            av_log(s, AV_LOG_ERROR, "App field don't match up: %s <-> %s. "
+               "Exiting since rtmp_strict_paths provided\n", tmpstr, rt->app);
+            return AVERROR(EIO);
+        } else {
+            av_log(s, AV_LOG_WARNING, "App field don't match up: %s <-> %s\n",
                tmpstr, rt->app);
+        }
+    }
     ff_rtmp_packet_destroy(&pkt);
 
     // Send Window Acknowledgement Size (as defined in specification)
@@ -1993,6 +2003,7 @@ static int send_invoke_response(URLContext *s, RTMPPacket *pkt)
     uint8_t *pp      = NULL;
     RTMPPacket spkt  = { 0 };
     GetByteContext gbc;
+    char expected_stream[sizeof(filename)];
     int ret;
 
     bytestream2_init(&gbc, p, pkt->size);
@@ -2029,9 +2040,41 @@ static int send_invoke_response(URLContext *s, RTMPPacket *pkt)
                 pchar = s->filename;
             }
             pchar++;
-            if (strcmp(pchar, filename))
-                av_log(s, AV_LOG_WARNING, "Unexpected stream %s, expecting"
+            if (rt->strict_stream_file) {
+                uint8_t *file_data = NULL;
+                size_t file_size = 0;
+                size_t mapped_size;
+
+                ret = av_file_map(rt->strict_stream_file, &file_data, &file_size, 0, s);
+                if (ret < 0)
+                    return ret;
+                mapped_size = file_size;
+                while (file_size && (file_data[file_size - 1] == '\n' ||
+                                     file_data[file_size - 1] == '\r'))
+                    file_size--;
+                if (!file_size || file_size >= sizeof(expected_stream) ||
+                    memchr(file_data, '\0', file_size)) {
+                    av_log(s, AV_LOG_ERROR,
+                           "rtmp_strict_stream_file must contain one non-empty stream name shorter than %zu bytes\n",
+                           sizeof(expected_stream));
+                    av_file_unmap(file_data, mapped_size);
+                    return AVERROR(EINVAL);
+                }
+                memcpy(expected_stream, file_data, file_size);
+                expected_stream[file_size] = '\0';
+                av_file_unmap(file_data, mapped_size);
+                pchar = expected_stream;
+            }
+            if (strcmp(pchar, filename)) {
+                if (rt->strict_paths) {
+                    av_log(s, AV_LOG_ERROR, "Unexpected stream. "
+                        "Exiting since rtmp_strict_paths provided.\n");
+                    return AVERROR(EIO);
+                } else {
+                    av_log(s, AV_LOG_WARNING, "Unexpected stream %s, expecting"
                        " %s\n", filename, pchar);
+                }
+            }
         }
         rt->state = STATE_RECEIVING;
     }
@@ -2697,6 +2740,12 @@ static int rtmp_open(URLContext *s, const char *uri, int flags, AVDictionary **o
     if (rt->listen_timeout > 0)
         rt->listen = 1;
 
+    if (rt->strict_stream_file && (!rt->listen || !rt->strict_paths)) {
+        av_log(s, AV_LOG_ERROR,
+               "rtmp_strict_stream_file requires rtmp_listen and rtmp_strict_paths\n");
+        return AVERROR(EINVAL);
+    }
+
     rt->is_input = !(flags & AVIO_FLAG_WRITE);
 
     av_url_split(proto, sizeof(proto), auth, sizeof(auth),
@@ -3225,6 +3274,8 @@ static const AVOption rtmp_options[] = {
     {"listen",      "Listen for incoming rtmp connections", OFFSET(listen), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
     {"tcp_nodelay", "Use TCP_NODELAY to disable Nagle's algorithm", OFFSET(tcp_nodelay), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, DEC|ENC},
     {"timeout", "Maximum timeout (in seconds) to wait for incoming connections. -1 is infinite. Implies -rtmp_listen 1",  OFFSET(listen_timeout), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, DEC, .unit = "rtmp_listen" },
+    {"rtmp_strict_paths", "Error instead of warn for mismatch on stream or application path in url", OFFSET(strict_paths), AV_OPT_TYPE_BOOL, {.i64 = 0 }, 0, 1, DEC},
+    {"rtmp_strict_stream_file", "Read the expected stream name from a file in strict listen mode", OFFSET(strict_stream_file), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, DEC},
     { NULL },
 };
 
